@@ -3,6 +3,8 @@
 from typing import Any, Dict, Iterable, Optional, List
 from datetime import datetime
 import libsql
+import tempfile
+import os
 
 from singer_sdk.streams import Stream
 from singer_sdk import typing as th
@@ -37,6 +39,7 @@ class TursoStream(Stream):
         self._primary_keys_config = primary_keys  # Store configured primary keys separately
         self._connection = None
         self._schema_cache = None
+        self._temp_db_path = None  # Track temp file for cleanup
 
         super().__init__(tap=tap, name=name, schema=None, **kwargs)
 
@@ -110,19 +113,35 @@ class TursoStream(Stream):
                     auth_token=config.get("auth_token"),
                 )
                 # Sync with remote database
-                self._connection.sync()
+                try:
+                    self.logger.info("Syncing with remote database...")
+                    self._connection.sync()
+                    self.logger.info("Sync completed successfully")
+                except Exception as sync_error:
+                    self.logger.warning(f"Initial sync failed: {sync_error}. Continuing with local replica.")
 
             # Remote connection only
             elif config.get("database_url"):
                 self.logger.info(f"Connecting to remote Turso database")
-                # For remote-only, we use embedded replica with temp local file
+                # For remote-only, we use embedded replica with a temp file
+                # Note: :memory: doesn't work well with sync()
+                temp_dir = tempfile.gettempdir()
+                self._temp_db_path = os.path.join(temp_dir, f"tap-turso-{os.getpid()}.db")
+
+                self.logger.info(f"Using temporary database file: {self._temp_db_path}")
                 self._connection = libsql.connect(
-                    database=":memory:",  # Use in-memory for remote-only
+                    database=self._temp_db_path,
                     sync_url=config["database_url"],
                     auth_token=config["auth_token"],
                 )
                 # Sync to pull data from remote
-                self._connection.sync()
+                try:
+                    self.logger.info("Syncing with remote database...")
+                    self._connection.sync()
+                    self.logger.info("Sync completed successfully")
+                except Exception as sync_error:
+                    self.logger.error(f"Sync failed: {sync_error}")
+                    raise RuntimeError(f"Failed to sync with remote database: {sync_error}")
 
             # Local database only
             else:
@@ -146,7 +165,8 @@ class TursoStream(Stream):
         conn = self._get_connection()
 
         # Query SQLite table info for primary key
-        result = conn.execute(f"PRAGMA table_info({self.table_name})").fetchall()
+        # Use double quotes to handle reserved keywords and special characters
+        result = conn.execute(f'PRAGMA table_info("{self.table_name}")').fetchall()
 
         primary_keys = []
         for row in result:
@@ -171,7 +191,8 @@ class TursoStream(Stream):
         conn = self._get_connection()
 
         # Get column information
-        result = conn.execute(f"PRAGMA table_info({self.table_name})").fetchall()
+        # Use double quotes to handle reserved keywords and special characters
+        result = conn.execute(f'PRAGMA table_info("{self.table_name}")').fetchall()
 
         if not result:
             raise ValueError(f"Table '{self.table_name}' not found in database")
@@ -266,8 +287,8 @@ class TursoStream(Stream):
             # Incremental query with replication key filter
             query = self._build_incremental_query(context)
         else:
-            # Full table query
-            query = f"SELECT * FROM {self.table_name}"
+            # Full table query - quote table name to handle reserved keywords
+            query = f'SELECT * FROM "{self.table_name}"'
 
         self.logger.info(f"Executing query: {query}")
 
@@ -279,8 +300,8 @@ class TursoStream(Stream):
         if hasattr(cursor, "description") and cursor.description:
             column_names = [desc[0] for desc in cursor.description]
         else:
-            # Fallback: get columns from PRAGMA
-            col_info = conn.execute(f"PRAGMA table_info({self.table_name})").fetchall()
+            # Fallback: get columns from PRAGMA - quote table name
+            col_info = conn.execute(f'PRAGMA table_info("{self.table_name}")').fetchall()
             column_names = [row[1] for row in col_info]
 
         # Fetch and yield records in batches
@@ -311,7 +332,8 @@ class TursoStream(Stream):
         Returns:
             SQL query string
         """
-        query = f"SELECT * FROM {self.table_name}"
+        # Quote table name and column names to handle reserved keywords
+        query = f'SELECT * FROM "{self.table_name}"'
 
         # Get starting replication key value from state
         start_value = self.get_starting_replication_key_value(context)
@@ -322,14 +344,14 @@ class TursoStream(Stream):
             # Determine if replication key is numeric or string/datetime
             # For safety, we use parameterized-style quoting
             if isinstance(start_value, (int, float)):
-                query += f" WHERE {self.replication_key} > {start_value}"
+                query += f' WHERE "{self.replication_key}" > {start_value}'
             else:
                 # String/datetime - quote the value
                 escaped_value = str(start_value).replace("'", "''")
-                query += f" WHERE {self.replication_key} > '{escaped_value}'"
+                query += f' WHERE "{self.replication_key}" > \'{escaped_value}\''
 
         # Order by replication key for consistent state updates
-        query += f" ORDER BY {self.replication_key} ASC"
+        query += f' ORDER BY "{self.replication_key}" ASC'
 
         return query
 
@@ -368,5 +390,17 @@ class TursoStream(Stream):
         if self._connection:
             try:
                 self._connection.close()
+            except Exception:
+                pass
+
+        # Clean up temporary database file if it was created
+        if self._temp_db_path and os.path.exists(self._temp_db_path):
+            try:
+                os.remove(self._temp_db_path)
+                # Also remove the associated -shm and -wal files if they exist
+                for ext in ["-shm", "-wal"]:
+                    temp_file = f"{self._temp_db_path}{ext}"
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
             except Exception:
                 pass
