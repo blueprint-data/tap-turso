@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "tap-turso"
+version = "0.1.0"
+description = "Singer tap for Turso SQLite databases, built with the Meltano Singer SDK."
+authors = ["Blueprint Data"]
+keywords = ["ELT", "singer.io", "turso", "sqlite"]
+license = "Apache-2.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.9,<4.0"
+singer-sdk = "^0.48.0"
+libsql = "^0.1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+black = "^23.7.0"
+flake8 = "^6.1.0"
+responses = "^0.25.0"
+
+[tool.poetry.scripts]
+tap-turso = 'tap_turso.tap:TapTurso.cli'
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

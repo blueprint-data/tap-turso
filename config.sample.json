@@ -1,0 +1,22 @@
+{
+  "database_url": "libsql://your-database.turso.io",
+  "auth_token": "your_turso_auth_token_here",
+  "tables": [
+    {
+      "name": "users",
+      "replication_method": "INCREMENTAL",
+      "replication_key": "updated_at",
+      "primary_key": ["id"]
+    },
+    {
+      "name": "orders",
+      "replication_method": "INCREMENTAL",
+      "replication_key": "modified_at"
+    },
+    {
+      "name": "products",
+      "replication_method": "FULL_TABLE"
+    }
+  ],
+  "batch_size": 1000
+}
