@@ -64,6 +64,23 @@ class TursoStream(Stream):
 
         return None
 
+    @primary_keys.setter
+    def primary_keys(self, value: Optional[List[str]]) -> None:
+        """Set primary key(s) for the stream.
+
+        Allows the Singer SDK to override primary keys from the catalog.
+        """
+        self._primary_keys_config = value
+
+    @property
+    def replication_method(self) -> str:
+        """Return the replication method for this stream.
+
+        Returns:
+            Either 'INCREMENTAL' or 'FULL_TABLE'
+        """
+        return self._replication_method
+
     @property
     def replication_key(self) -> Optional[str]:
         """Return replication key for incremental sync."""
@@ -71,11 +88,46 @@ class TursoStream(Stream):
             return self._replication_key_config
         return None
 
+    @replication_method.setter
+    def replication_method(self, value: str) -> None:
+        """Set the replication method for this stream.
+
+        Allows the Singer SDK to override replication method from the catalog.
+        """
+        self._replication_method = value
+    
+    @replication_key.setter
+    def replication_key(self, value: Optional[str]) -> None:
+        """Set the replication key for this stream.
+
+        Allows the Singer SDK to override replication key from the catalog.
+        """
+        self._replication_key_config = value
+
     @property
     def is_sorted(self) -> bool:
         """Return True if data is sorted by replication key."""
         # We explicitly sort by replication key in our query
         return self._replication_method == "INCREMENTAL"
+
+    def get_starting_replication_key_value(self, context: Optional[dict]) -> Optional[Any]:
+        """Get the starting replication key value from state.
+
+        Calls the parent implementation and logs the result for debugging.
+
+        Args:
+            context: Stream context
+
+        Returns:
+            Starting replication key value, or None if no state exists
+        """
+        # Call the parent SDK implementation which properly reads from bookmarks
+        start_value = super().get_starting_replication_key_value(context)
+
+        # Log for debugging
+        self.logger.info(f"Stream '{self.name}' starting replication value: {start_value}")
+
+        return start_value
 
     @property
     def schema(self) -> dict:
@@ -338,7 +390,10 @@ class TursoStream(Stream):
         # Get starting replication key value from state
         start_value = self.get_starting_replication_key_value(context)
 
-        self.logger.info(f"Incremental sync starting from: {start_value}")
+        if start_value:
+            self.logger.info(f"Incremental sync: fetching records where {self.replication_key} > {start_value}")
+        else:
+            self.logger.info(f"Incremental sync: no previous state, fetching all records")
 
         if start_value:
             # Determine if replication key is numeric or string/datetime
