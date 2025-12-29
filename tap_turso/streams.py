@@ -5,6 +5,7 @@ from datetime import datetime
 import libsql
 import tempfile
 import os
+import time
 
 from singer_sdk.streams import Stream
 from singer_sdk import typing as th
@@ -142,13 +143,94 @@ class TursoStream(Stream):
         self._schema_cache = self._discover_schema()
         return self._schema_cache
 
+    def _connect_with_retry(self, connect_func, max_retries: int = 3, initial_delay: float = 1.0):
+        """Execute connection function with exponential backoff retry logic.
+
+        Args:
+            connect_func: Function that returns a connection object
+            max_retries: Maximum number of retry attempts
+            initial_delay: Initial delay in seconds before first retry
+
+        Returns:
+            Connection object from connect_func
+
+        Raises:
+            Exception: If connection fails after all retries
+        """
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                start_time = time.time()
+                self.logger.info(f"Connecting to database (attempt {attempt + 1}/{max_retries})...")
+                self.logger.info("This may take a while for large databases - syncing from remote...")
+                connection = connect_func()
+                elapsed = time.time() - start_time
+                self.logger.info(f"Connection established successfully in {elapsed:.2f} seconds")
+                return connection
+            except Exception as error:
+                elapsed = time.time() - start_time
+                last_error = error
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                    self.logger.warning(
+                        f"Connection attempt {attempt + 1} failed after {elapsed:.2f}s: {error}. "
+                        f"Retrying in {delay} seconds..."
+                    )
+                    time.sleep(delay)
+                else:
+                    # Last attempt failed
+                    self.logger.error(f"Connection failed after {max_retries} attempts and {elapsed:.2f}s: {error}")
+
+        raise last_error
+
+    def _sync_with_retry(self, connection, max_retries: int = 3, initial_delay: float = 1.0):
+        """Sync database with remote using exponential backoff retry logic.
+
+        Args:
+            connection: libsql connection object
+            max_retries: Maximum number of retry attempts
+            initial_delay: Initial delay in seconds before first retry
+
+        Raises:
+            Exception: If sync fails after all retries
+        """
+        for attempt in range(max_retries):
+            try:
+                start_time = time.time()
+                self.logger.info(f"Syncing with remote database (attempt {attempt + 1}/{max_retries})...")
+                self.logger.info("Downloading database changes from Turso...")
+                connection.sync()
+                elapsed = time.time() - start_time
+                self.logger.info(f"Sync completed successfully in {elapsed:.2f} seconds")
+                return
+            except Exception as sync_error:
+                elapsed = time.time() - start_time
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                    self.logger.warning(
+                        f"Sync attempt {attempt + 1} failed after {elapsed:.2f}s: {sync_error}. "
+                        f"Retrying in {delay} seconds..."
+                    )
+                    time.sleep(delay)
+                else:
+                    # Last attempt failed
+                    self.logger.error(f"Sync failed after {max_retries} attempts and {elapsed:.2f}s: {sync_error}")
+                    raise
+
     def _get_connection(self):
         """Get or create database connection.
 
         Returns:
             libsql connection object
         """
+        # Check if stream already has a connection
         if self._connection is not None:
+            return self._connection
+
+        # Check if tap has a shared connection we can reuse
+        if hasattr(self._tap, '_shared_connection') and self._tap._shared_connection is not None:
+            self.logger.info("Reusing shared connection from tap")
+            self._connection = self._tap._shared_connection
             return self._connection
 
         config = self.config
@@ -159,18 +241,21 @@ class TursoStream(Stream):
                 self.logger.info(
                     f"Connecting to Turso with embedded replica: {config.get('local_path', 'local.db')}"
                 )
-                self._connection = libsql.connect(
-                    database=config.get("local_path", "local.db"),
-                    sync_url=config["sync_url"],
-                    auth_token=config.get("auth_token"),
-                )
-                # Sync with remote database
+
+                # Use retry logic for connection (which includes initial sync)
+                def connect_embedded_replica():
+                    return libsql.connect(
+                        database=config.get("local_path", "local.db"),
+                        sync_url=config["sync_url"],
+                        auth_token=config.get("auth_token"),
+                    )
+
                 try:
-                    self.logger.info("Syncing with remote database...")
-                    self._connection.sync()
-                    self.logger.info("Sync completed successfully")
-                except Exception as sync_error:
-                    self.logger.warning(f"Initial sync failed: {sync_error}. Continuing with local replica.")
+                    self._connection = self._connect_with_retry(connect_embedded_replica)
+                except Exception as conn_error:
+                    self.logger.warning(f"Failed to connect with sync: {conn_error}. Trying local-only mode.")
+                    # Fallback: try connecting without sync
+                    self._connection = libsql.connect(database=config.get("local_path", "local.db"))
 
             # Remote connection only
             elif config.get("database_url"):
@@ -181,19 +266,16 @@ class TursoStream(Stream):
                 self._temp_db_path = os.path.join(temp_dir, f"tap-turso-{os.getpid()}.db")
 
                 self.logger.info(f"Using temporary database file: {self._temp_db_path}")
-                self._connection = libsql.connect(
-                    database=self._temp_db_path,
-                    sync_url=config["database_url"],
-                    auth_token=config["auth_token"],
-                )
-                # Sync to pull data from remote
-                try:
-                    self.logger.info("Syncing with remote database...")
-                    self._connection.sync()
-                    self.logger.info("Sync completed successfully")
-                except Exception as sync_error:
-                    self.logger.error(f"Sync failed: {sync_error}")
-                    raise RuntimeError(f"Failed to sync with remote database: {sync_error}")
+
+                # Use retry logic for connection (which includes initial sync)
+                def connect_remote():
+                    return libsql.connect(
+                        database=self._temp_db_path,
+                        sync_url=config["database_url"],
+                        auth_token=config["auth_token"],
+                    )
+
+                self._connection = self._connect_with_retry(connect_remote)
 
             # Local database only
             else:
@@ -205,6 +287,11 @@ class TursoStream(Stream):
         except Exception as e:
             self.logger.error(f"Failed to connect to database: {e}")
             raise RuntimeError(f"Database connection failed: {e}")
+
+        # Store connection in tap for reuse by other streams
+        if hasattr(self._tap, '_shared_connection'):
+            self.logger.info("Storing connection in tap for reuse by other streams")
+            self._tap._shared_connection = self._connection
 
         return self._connection
 
@@ -240,6 +327,7 @@ class TursoStream(Stream):
         Returns:
             Singer schema dictionary
         """
+        self.logger.info(f"Inspecting schema for table '{self.table_name}'...")
         conn = self._get_connection()
 
         # Get column information
@@ -249,6 +337,7 @@ class TursoStream(Stream):
         if not result:
             raise ValueError(f"Table '{self.table_name}' not found in database")
 
+        self.logger.info(f"Found {len(result)} columns in table '{self.table_name}'")
         property_list = []
 
         for row in result:
@@ -343,9 +432,13 @@ class TursoStream(Stream):
             query = f'SELECT * FROM "{self.table_name}"'
 
         self.logger.info(f"Executing query: {query}")
+        query_start_time = time.time()
 
         # Execute query and fetch in batches
+        self.logger.info(f"Running query on table '{self.table_name}'...")
         cursor = conn.execute(query)
+        query_exec_time = time.time() - query_start_time
+        self.logger.info(f"Query executed in {query_exec_time:.2f} seconds, now fetching results...")
 
         # Get column names from cursor description
         # Note: libsql cursor.description format is [(name, type_code), ...]
@@ -356,23 +449,41 @@ class TursoStream(Stream):
             col_info = conn.execute(f'PRAGMA table_info("{self.table_name}")').fetchall()
             column_names = [row[1] for row in col_info]
 
+        self.logger.info(f"Fetching records in batches of {batch_size}...")
+
         # Fetch and yield records in batches
         record_count = 0
+        batch_count = 0
+        fetch_start_time = time.time()
+
         while True:
+            batch_start = time.time()
             rows = cursor.fetchmany(batch_size)
             if not rows:
                 break
 
+            batch_count += 1
             for row in rows:
                 record = self._row_to_dict(row, column_names)
                 record["_sdc_extracted_at"] = datetime.utcnow().isoformat()
                 record_count += 1
                 yield record
 
-            self.logger.info(f"Fetched {record_count} records from {self.table_name}")
+            batch_time = time.time() - batch_start
+            elapsed = time.time() - fetch_start_time
+            records_per_sec = record_count / elapsed if elapsed > 0 else 0
 
+            self.logger.info(
+                f"Batch {batch_count}: Fetched {len(rows)} records "
+                f"(total: {record_count}, rate: {records_per_sec:.1f} records/sec, "
+                f"batch time: {batch_time:.2f}s)"
+            )
+
+        total_time = time.time() - query_start_time
+        avg_rate = record_count / total_time if total_time > 0 else 0
         self.logger.info(
-            f"Completed fetching {record_count} total records from {self.table_name}"
+            f"Completed fetching {record_count} total records from {self.table_name} "
+            f"in {total_time:.2f} seconds (avg: {avg_rate:.1f} records/sec)"
         )
 
     def _build_incremental_query(self, context: Optional[dict]) -> str:

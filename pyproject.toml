@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "tap-turso"
-version = "0.1.0"
+version = "0.1.4"
 description = "Singer tap for Turso SQLite databases, built with the Meltano Singer SDK."
 authors = ["Blueprint Data"]
 keywords = ["ELT", "singer.io", "turso", "sqlite"]

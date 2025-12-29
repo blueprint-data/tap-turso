@@ -12,6 +12,7 @@ class TapTurso(Tap):
     """Singer tap for Turso SQLite databases."""
 
     name = "tap-turso"
+    _shared_connection = None  # Shared connection across all streams
 
     config_jsonschema = th.PropertiesList(
         # Connection settings
